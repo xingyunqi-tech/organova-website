@@ -1,18 +1,18 @@
 # 镜像仓库清理工作流
-# 清理 GHCR 与 TCR 个人版中的旧镜像，app / nginx 各保留最新 1 个版本
+# 清理 GHCR 与 TCR 个人版中的旧镜像，app / nginx 各保留最近 2 个版本
 #
 # 触发条件:
 #   1. build-deploy.yml 全部部署成功后自动调用
 #   2. 每周一 03:00（北京时间）定时执行
 #   3. 手动触发（可选 dry_run 只打印不删除）
 #
-# GHCR: 保留最新 1 个带 tag 的镜像，buildcache 不参与清理，同时删除无 tag 的镜像
-# TCR:  保留与 latest 指向同一镜像的所有 tag，其余 tag 删除
+# GHCR: 保留最近 2 个带 tag 的镜像，buildcache 不参与清理，同时删除无 tag 的镜像
+# TCR:  保留 latest 指向的镜像及其之前最近推送的 1 个镜像（含各自全部 tag），其余 tag 删除
 #
 # TCR 清理需要额外配置仓库级 Secrets（未配置时跳过 TCR 清理）:
 #   TENCENTCLOUD_SECRET_ID / TENCENTCLOUD_SECRET_KEY（建议使用仅授权 TCR 的 CAM 子账号）
 # 以及仓库级 Variables:
-#   TENCENT_TCR_REGION（TCR 个人版所在地域，如 ap-guangzhou）
+#   TENCENT_TCR_REGION（可选，TCR 个人版所在地域，默认 ap-guangzhou）
 #   TENCENT_TCR_NAMESPACE（与 build-deploy.yml 共用）
 
 name: Cleanup Registry
@@ -58,7 +58,7 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           packages: ${{ steps.pkg.outputs.packages }}
-          keep-n-tagged: 1
+          keep-n-tagged: 2
           exclude-tags: buildcache
           delete-untagged: true
           dry-run: ${{ inputs.dry_run == true }}
@@ -86,7 +86,7 @@ jobs:
         env:
           TENCENTCLOUD_SECRET_ID: ${{ secrets.TENCENTCLOUD_SECRET_ID }}
           TENCENTCLOUD_SECRET_KEY: ${{ secrets.TENCENTCLOUD_SECRET_KEY }}
-          TENCENTCLOUD_REGION: ${{ vars.TENCENT_TCR_REGION }}
+          TENCENTCLOUD_REGION: ${{ vars.TENCENT_TCR_REGION || 'ap-guangzhou' }}
           TCR_NAMESPACE: ${{ vars.TENCENT_TCR_NAMESPACE }}
 
       - name: Install tccli
@@ -105,7 +105,7 @@ jobs:
             local repo="$1" offset=0 page count
             while :; do
               page=$(tccli tcr DescribeImagePersonal --RepoName "$repo" --Offset "$offset" --Limit 100)
-              jq -c '(.Response // .).Data.TagInfo[] | {name: .TagName, digest: .TagId}' <<< "$page"
+              jq -c '(.Response // .).Data.TagInfo[] | {name: .TagName, digest: .TagId, time: (.PushTime // .UpdateTime // .CreationTime // "")}' <<< "$page"
               count=$(jq '(.Response // .).Data.TagInfo | length' <<< "$page")
               (( count < 100 )) && break
               offset=$(( offset + 100 ))
@@ -115,15 +115,19 @@ jobs:
           for repo in "$repo_base" "${repo_base}-nginx"; do
             echo "::group::${repo}"
             tags=$(list_tags "$repo")
-            keep_digest=$(jq -r 'select(.name == "latest") | .digest' <<< "$tags")
-            if [[ -z "$keep_digest" ]]; then
+            latest_digest=$(jq -r 'select(.name == "latest") | .digest' <<< "$tags")
+            if [[ -z "$latest_digest" ]]; then
               echo "::error::${repo} 没有 latest tag，跳过清理"
               echo "::endgroup::"
               has_error=1
               continue
             fi
-            echo "保留镜像: ${keep_digest}"
-            mapfile -t stale < <(jq -r --arg d "$keep_digest" 'select(.digest != $d) | .name' <<< "$tags")
+            keep_digests=$(jq -sc --arg l "$latest_digest" --argjson n "$KEEP_COUNT" '
+              [$l] + (map(select(.digest != $l)) | group_by(.digest)
+                | map({digest: .[0].digest, time: (map(.time) | max)})
+                | sort_by(.time) | reverse | .[:($n - 1)] | map(.digest))' <<< "$tags")
+            echo "保留镜像: $(jq -r 'join(", ")' <<< "$keep_digests")"
+            mapfile -t stale < <(jq -r --argjson k "$keep_digests" 'select(.digest as $d | $k | index($d) | not) | .name' <<< "$tags")
             if (( ${#stale[@]} == 0 )); then
               echo "无需清理"
             fi
@@ -141,7 +145,8 @@ jobs:
         env:
           TENCENTCLOUD_SECRET_ID: ${{ secrets.TENCENTCLOUD_SECRET_ID }}
           TENCENTCLOUD_SECRET_KEY: ${{ secrets.TENCENTCLOUD_SECRET_KEY }}
-          TENCENTCLOUD_REGION: ${{ vars.TENCENT_TCR_REGION }}
+          TENCENTCLOUD_REGION: ${{ vars.TENCENT_TCR_REGION || 'ap-guangzhou' }}
           TCR_NAMESPACE: ${{ vars.TENCENT_TCR_NAMESPACE }}
           REPO_NAME: ${{ github.repository }}
           DRY_RUN: ${{ inputs.dry_run == true }}
+          KEEP_COUNT: 2
