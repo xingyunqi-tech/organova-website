@@ -1,5 +1,5 @@
 ##### BASE
-FROM node:22-alpine AS base
+FROM node:24-alpine AS base
 # 国内构建传入 --build-arg NPM_REGISTRY=https://registry.npmmirror.com
 ARG NPM_REGISTRY=https://registry.npmjs.org
 ENV COREPACK_NPM_REGISTRY=$NPM_REGISTRY
@@ -67,7 +67,7 @@ RUN rm -rf /usr/share/nginx/public/uploads
 RUN mkdir -p /usr/share/nginx/uploads
 
 ##### RUNNER（默认构建目标）
-FROM node:22-alpine AS runner
+FROM node:24-alpine AS runner
 WORKDIR /app
 
 ENV NODE_ENV=production
